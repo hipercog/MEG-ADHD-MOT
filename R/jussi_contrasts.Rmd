@@ -1,0 +1,55 @@
+---
+title: "Obtaining identical results from 1x6 and 2x3 ANOVAs (interactions and main effects)"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r error=TRUE}
+
+suppressPackageStartupMessages(library(tidyverse))
+suppressPackageStartupMessages(library(lmerTest))
+suppressPackageStartupMessages(library(lme4))
+suppressPackageStartupMessages(library(car))
+suppressPackageStartupMessages(library(multcomp))
+setwd("/Users/jpalomak/Desktop/")
+
+mimplant_test <- read.csv("/Users/jpalomak/Desktop/mimplant4.csv")
+
+#Set up contrasts correctly for type 3 SS Anova:
+options(contrasts = c("contr.sum", "contr.poly"))
+
+#METHOD ONE: Fit 2x3 ANOVA using lm():
+mimplant4modelTWOWAY <- lm(Mooddv1 ~ moodoutcome * moodtechnology, data=mimplant_test)
+Anova(mimplant4modelTWOWAY, type=3)
+
+#METHOD TWO. First create a single factor with 2x3 = 6 levels:
+mimplant_test$all_factors <- interaction(mimplant_test$moodoutcome, mimplant_test$moodtechnology)
+levels(mimplant_test$all_factors)
+
+#Fit 1x6 ANOVA using this 6-level factor:
+mimplant4modelONEWAY <- lm(Mooddv1 ~ all_factors, data=mimplant_test)
+Anova(mimplant4modelONEWAY, type=3)
+
+#Next, we'll use custom contrasts on our 1x6 ANOVA to pull out the exact same values as in the 2x3 ANOVA. First, form contrast for the MAIN EFFECT of "technology" (experimental vs. established):
+main_effect_technology <- rbind("Main effect of Technology" = c(-1,-1,-1,1,1,1))
+
+#Next, do the same for "outcome" (alleviating vs. healthy vs. superhuman). Note that this is a tricky contrast! It's an F-contrast instead of a T-contrast, which means we need to construct two vectors: the first one compares "alleviating" against "healthy", and the second compares "healthy" against "superhuman". The null hypothesis test is alleviating=healthy=superhuman, so if alleviating=healthy OR healthy=superhuman, then alleviating=superhuman is redundant:
+allev_vs_healthy <- rbind("Alleviating vs. Healthy" = c(1,-1,0,1,-1,0))
+healthy_vs_super <- rbind("Healthy vs. Superhuman" = c(0,-1,1,0,-1,1))
+
+#Create matrix contrast for the MAIN EFFEFCT of "outcome":
+main_effect_moodoutcome <- rbind(allev_vs_healthy, healthy_vs_super)
+
+#Now, simply take the PRODUCT of the two main effect contrasts as a matrix
+interaction_outcome.technology <- rbind(main_effect_technology*allev_vs_healthy,
+                                        main_effect_technology*healthy_vs_super)
+
+#Perform contrast analyses. Compare the output against the original type-3 SS table of the 2x3 ANOVA. The numbers are identical.
+#MAIN EFFECT OF TECHNOLOGY:
+summary(glht(mimplant4modelONEWAY, linfct = mcp(all_factors = main_effect_technology)), test=Ftest())
+#MAIN EFFECT OF OUTCOME:
+summary(glht(mimplant4modelONEWAY, linfct = mcp(all_factors = main_effect_moodoutcome)), test=Ftest())
+#INTERACTION TECHNOLOGY*OUTCOME:
+summary(glht(mimplant4modelONEWAY, linfct = mcp(all_factors = interaction_outcome.technology)), test=Ftest())
+```

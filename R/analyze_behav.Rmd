@@ -1,0 +1,1037 @@
+---
+title: 'MOT ADHD: Behavioral data analysis'
+author: "Ben Cowley (adapted from Sami Karadeniz)"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '4'
+  html_document:
+    theme: readable
+    toc: no
+    toc_depth: 4
+    toc_float:
+      collapsed: yes
+---
+  
+# Setup
+  
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+# Load libraries
+#library(Rmisc)
+# library(gghalves)
+# library(kableExtra)
+# library(knitr)
+library(forcats)
+library(here)
+library(ez)
+library(retimes)
+library(afex)
+library(multcomp)
+library(emmeans)
+library(lmerTest)
+library(lme4)
+library(car)
+library(sjPlot)
+library(tidyverse)
+source('znbnz_utils.R')
+
+#         THIS SCRIPT IS CREATED USING DUMMY DATA, SO ID IS CODED AS ID_MOT AT SOME PLACEs
+# Path to demographics excel-file.
+demographics_path <- paste0(here(), "/data/subjects_log.xlsx")
+
+# Path to the folder containing trials data in csv-format.
+trials_path <- paste0(here(), "/data/trials")
+
+# Path to figure output folder
+SAVE <- FALSE
+odir <- paste0(here(), "/Figures/")
+
+# Define the theme of the plots as a variable.
+plot_theme <- "theme_minimal"
+DIAGNOSTICS <- TRUE
+PLOTS <- TRUE
+```
+
+
+```{r load_data, include = FALSE, warning = FALSE}
+# Load data import functions.
+source("functions/import_trials_data_csv.r")
+
+# Load demographics data.
+demographics <- readxl::read_xlsx(demographics_path)
+
+# Load trials data.
+trials_data <- import_trials_data(trials_path)
+```
+
+
+```{r recode_variables, include = FALSE, warning = FALSE}
+# Re-code variables: demographics.
+# demographics$Subj = demographics$ID
+demographics$ID_MOT <- as.factor(sprintf('%02d', demographics$ID_MOT))
+demographics$ID <- as.factor(demographics$ID)
+
+# Re-code variables: trials data.
+trials_data$ID = as.factor(trials_data$ID)
+trials_data$Group = as.factor(trials_data$Group)
+trials_data$Group <- relevel(trials_data$Group, "Control")
+trials_data$Task = as.factor(trials_data$Task)
+trials_data$Distractors = as.factor(trials_data$Distractors)
+trials_data$TrialType = as.factor(trials_data$TrialType)
+trials_data$Hemifield = as.factor(trials_data$Hemifield)
+trials_data$Visibility = as.factor(trials_data$Visibility)
+trials_data$PhotoD = as.factor(trials_data$PhotoD)
+trials_data$Resp = as.factor(trials_data$Resp)
+trials_data$Blink = as.factor(trials_data$Blink)
+```
+
+
+# Preprocessing
+
+## Pruning
+
+__Discarding subjects before preprocessing__. First, we use the following criteria for choosing the subjects to be 
+preprocessed in the first place:
+  
+  * subjects have been measured with the photodetector
+  * subjects have the full number of usable sets (= 4)
+  * subjects do not have too many trial-rejections
+
+```{r discard_by_photod-sets, warning = FALSE}
+# filter(Photodetector == TRUE, n_sets == 4) %>% 
+demographics %>% 
+  filter(Valid_for_analysis == TRUE) %>%
+  mutate("dom_resp" = Handedness == Response_hand) %>%
+  select(ID, dom_resp) %>% 
+  inner_join(trials_data, by = "ID") -> analysis_trials
+analysis_trials$ID = as.factor(analysis_trials$ID)
+
+levels(analysis_trials$Resp)[1] <- "Hit"
+levels(analysis_trials$Resp)[2] <- "False Alarm"
+```
+
+
+## Trim RT distributions? 
+
+Let's take a look at the reaction time distribution for each subject.
+
+```{r preproc_rt_original, warning = FALSE, fig.align = "center"}
+if (PLOTS){
+# Reaction time scatter plot.
+analysis_trials %>%
+  filter(RT > 0) %>% 
+  ggplot(aes(x = ID, y = RT)) +
+    geom_jitter() +
+    # scale_y_continuous(limits = c(0, 0.700), breaks = seq(0, 0.700, 0.100)) +
+    xlab("Subject") +  
+    ylab("Reaction time (s)") +
+    ggtitle("Reaction time distribution, all subjects, all trials") +
+    get(plot_theme)() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Reaction time cumulative distribution.
+analysis_trials %>% 
+  filter(RT > 0) %>% 
+  ggplot(aes(x = RT)) +
+    stat_ecdf(aes(color = ID)) +
+    scale_y_continuous(labels = scales::percent) +
+    scale_color_brewer(palette = "Set1") +
+    xlab("Reaction time (s)") +
+    ylab(NULL) +
+    ggtitle(paste("Cumulative reaction time distribution, all subjects,",
+                  "all trials")) +
+    get(plot_theme)() +
+    theme(legend.position = "none") 
+}
+```
+
+
+_It appears that provided data has already been trimmed between 200 and 900ms_! 
+__If__ we believe that the RT distribution tails reflect theoretically invalid processes, we could justify trimming them to some theoretical limit, E.g. 180 ms (which is mean minus 2SD, based on Table 2 from Woods, et al., 2015 Front Hum Neurosci. 2015; 9:131).
+
+_However_, we actually have no strong motivation for this approach, since
+
+(a) it is not that clear where the threshold should be
+(b) we aim to use parametric test statistics (based on fitting ex-gaussian distribution), for which it is better to have the original data for fitting and rely on the robustness of the statistics to account for outliers.
+
+In summary, if we can get the untrimmed RTs, I would prefer to use that. 
+
+<!-- Still, we visualise how many trials would be rejected based on such thresholds -->
+
+## Generate IVs
+
+```{r preproc_rt, warning = FALSE, fig.align = "center", include=FALSE}
+analysis_trials -> trials_ok
+# We'll create one data frame for each behavioral performance measure.
+
+# ex-Gaussian mean, sd, and tau
+exgauss.mx <- trials_ok %>%
+  filter(TrialType == "Real", Resp == "Hit") %>%
+  group_by(ID, dom_resp, Group, Task, Distractors) %>%
+  do(data.frame(as.list(retimes::mexgauss(.$RT))))
+exgauss.mx$Task <- droplevels(exgauss.mx$Task, exclude = "AttendNone")
+
+exgauss.bt <- trials_ok %>%
+  filter(TrialType == "Real", Resp == "Hit") %>%
+  group_by(Group, dom_resp, ID, Task, Distractors) %>%
+  summarise(timefit_out = list(data.frame(t(attr(retimes::timefit(RT),"par"))))) %>%
+  unnest(cols = c(timefit_out)) %>% ungroup
+exgauss.bt$Task <- droplevels(exgauss.bt$Task, exclude = "AttendNone")
+
+exgauss <- exgauss.mx
+exgauss$Group <- relevel(exgauss$Group, ref = "Control")
+exgauss$all_factors <- with(exgauss, interaction(Group, Distractors, Task))
+
+# Hit rates.
+trials_ok %>%
+  filter(TrialType == "Real") %>%
+  group_by(ID, dom_resp, Group, Task, Distractors) %>%
+  summarise(n_trials = n(),
+            hit_rate = sum(Resp == "Hit") / n_trials) -> 
+  hit_rates
+hit_rates$Task <- droplevels(hit_rates$Task, exclude = "AttendNone")
+# hit_rates$sq_hr <- hit_rates$hit_rate ^ 2
+
+
+# False alarms.
+trials_ok %>%
+  filter(TrialType == "Catch", Task != "AttendFull") %>%
+  group_by(ID, dom_resp, Group, Task, Distractors) %>%
+  summarise(n_trials = n(),
+            fa_rate = sum(Resp == "False Alarm") / n_trials) -> 
+  fa_rates
+fa_rates$Task <- droplevels(fa_rates$Task, exclude = "AttendFull")
+# fa_rates$sq_far <- fa_rates$fa_rate ^ 2
+
+
+# Distractor effect.
+hit_rates %>%
+  select(-n_trials) %>%
+  spread(key = "Distractors", value = "hit_rate") %>%
+  mutate(distractor_effect = (Absent - Present) / (Absent + Present)) %>%
+  select(-Absent, -Present) -> 
+  distractor_effect
+distractor_effect$Task <- droplevels(distractor_effect$Task, exclude = "AttendNone")
+# distractor_effect$log_de <- log(distractor_effect$distractor_effect)
+
+
+```
+
+
+```{r Setup_contrasts}
+grid.lvls <- expand.grid(Task = c('AttendFull', 'AttendLeft', 'AttendRight'),
+                         Distractors = c('Absent', 'Present'),
+                         Group = c('ADHD', 'Control'))
+
+con_FvLR_adhd <- rbind("FvLR_adhd" = c(0,0.5,0,0.5,0,-0.25,0,-0.25,0,-0.25,0,-0.25))
+con_LvFR_adhd <- rbind("LvFR_adhd" = c(0,-0.25,0,-0.25,0,0.5,0,0.5,0,-0.25,0,-0.25))
+con_RvFL_adhd <- rbind("RvFL_adhd" = c(0,-0.25,0,-0.25,0,-0.25,0,-0.25,0,0.5,0,0.5))
+con_dstr_adhd <- rbind("dstr_adhd" = c(0,1/3,0,-1/3,0,1/3,0,-1/3,0,1/3,0,-1/3))
+con_drAF_adhd <- rbind("drAF_adhd" = contrasts21(con_FvLR_adhd * con_dstr_adhd))
+con_drAL_adhd <- rbind("drAL_adhd" = contrasts21(con_LvFR_adhd * con_dstr_adhd))
+con_drAR_adhd <- rbind("drAR_adhd" = contrasts21(con_RvFL_adhd * con_dstr_adhd))
+
+con_FvLR_ctrl <- rbind("FvLR_ctrl" = c(0.5,0,0.5,0,-0.25,0,-0.25,0,-0.25,0,-0.25,0))
+con_LvFR_ctrl <- rbind("LvFR_ctrl" = c(-0.25,0,-0.25,0,0.5,0,0.5,0,-0.25,0,-0.25,0))
+con_RvFL_ctrl <- rbind("RvFL_ctrl" = c(-0.25,0,-0.25,0,-0.25,0,-0.25,0,0.5,0,0.5,0))
+con_dstr_ctrl <- rbind("dstr_ctrl" = c(1/3,0,-1/3,0,1/3,0,-1/3,0,1/3,0,-1/3,0))
+con_drAF_ctrl <- rbind("drAF_ctrl" = contrasts21(con_FvLR_ctrl * con_dstr_ctrl))
+con_drAL_ctrl <- rbind("drAL_ctrl" = contrasts21(con_LvFR_ctrl * con_dstr_ctrl))
+con_drAR_ctrl <- rbind("drAR_ctrl" = contrasts21(con_RvFL_ctrl * con_dstr_ctrl))
+
+con_drAF_CvA <- rbind("drAF_CvA" = contrasts21(con_drAF_adhd * -1 + con_drAF_ctrl))
+con_drAL_CvA <- rbind("drAL_CvA" = contrasts21(con_drAL_adhd * -1 + con_drAL_ctrl))
+con_drAR_CvA <- rbind("drAR_CvA" = contrasts21(con_drAR_adhd * -1 + con_drAR_ctrl))
+```
+
+
+
+# Results
+Results are given for each **task** x **distractor state** combination at the
+group and single subject levels. For each DV below, we first show QQ-plots and conditional distributions/boxplots/bar-charts, and test the effect of response handedness for Controls. We then test the main effects and interactions with repeated-measures ANOVA and also LMM models. 
+
+We perform contrast analysis using 'emmeans' package: this provides an ANOVA-like table from F-contrasts  for each combination of factors. Any specific contrast not included in these combinations is provided by general linear hypothesis test (GLHT) with custom-defined coefficients for the LMM model DV = ALL x ALL.
+  
+Speed
+
+* reaction time mean, estimated from ex-gaussian fit (mu of the gaussian part)
+* reaction time variability, estimated from ex-gaussian fit (sigma of the gaussian part)
+* reaction time slowing, estimated from long-tail of ex-gaussian fit (tau)
+
+Accuracy
+
+* hit rates
+* false alarm rates
+* distractor effects (calculated in the following way)
+  
+  $$\frac{HR_{distractors \ absent} - HR_{distractors \ present}}
+{HR_{distractors \ absent} + HR_{distractors \ present}}$$
+
+
+## MU
+
+__Ex-Gaussian stats of Reaction time - mu (gaussian central estimate)__
+
+```{r exgauss-mu, warning = FALSE, fig.align = "center"}
+
+qqnorm(exgauss$mu, main = "mu Normal Q-Q Plot")
+qqline(exgauss$mu)
+exgauss %>%
+  ggplot(aes(mu, fill=Task)) +
+  geom_density(alpha=.4) +
+  facet_wrap(Group~Distractors, ncol=2) +
+  get(plot_theme)()
+
+# exgauss-mu, group level.
+exgauss %>%
+  ggplot(aes(x = Distractors, y = mu, linetype = Group, color = Group)) +
+  geom_boxplot(outlier.alpha = 0, alpha = 1/5) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2)) +
+  facet_wrap(~Task) +
+  xlab("Distractor state") +
+  ylab("RT ex-gauss mu (ms)") +
+  ggtitle("RT ex-gauss mu, all task conditions, group level") +
+  get(plot_theme)()
+if (SAVE)
+  ggsave(paste0(odir, "RTmu.svg"))
+
+# RT ex-gauss mu, group level, barchart with SEM.
+p_dodge <- position_dodge(width = 0.9)
+
+exgauss %>%
+  group_by(Group, Task, Distractors) %>%
+  summarise(exgmu_mean = mean(mu), exgmu_sem = sd(mu)/sqrt(n())) %>%
+  ggplot(aes(x = Distractors, y = exgmu_mean, fill = Group)) +
+  geom_col(position = p_dodge) +
+  geom_errorbar(aes(ymin = exgmu_mean - exgmu_sem, ymax = exgmu_mean + exgmu_sem),
+                position = p_dodge, width = 0.25) +
+  facet_wrap(~Task) +
+  xlab("Distractor state") +
+  ylab("Mean of RT ex-gauss mu (ms)") +
+  ggtitle("RT ex-gauss mu, all task conditions, group level, +/- SEM") +
+  scale_fill_brewer(palette = "Greys") +
+  get(plot_theme)()
+
+# RT ex-gauss mu, single subject.
+exgauss %>%
+  ggplot(aes(x = Distractors, y = mu, color = dom_resp)) +
+  geom_line(aes(group = ID)) +
+  geom_point() +
+  facet_grid(Group ~ Task) +
+  xlab("Distractor state") +
+  ylab("RT ex-gauss mu (ms)") +
+  ggtitle("RT ex-gauss mu, all task conditions, single subject") +
+  get(plot_theme)() +
+  theme(legend.position = "none")
+
+# # Does response hand counter-balancing in CONTROL group affect exgauss MU?
+with(exgauss,
+     ks.test(exgauss[Group == "Control" & dom_resp == FALSE,]$mu,
+             exgauss[Group == "Control" & dom_resp == TRUE,]$mu))
+```
+
+
+### Statistics for RT ex-gauss mu
+
+```{r rt_exgauss_mu_stats, warning = FALSE, fig.align = "center"}
+# Mixed 3-way ANOVA.
+exgmu_stats <- ezANOVA(exgauss, dv = .(mu),
+                       wid = .(ID),
+                       within = .(Task, Distractors),
+                       between = .(Group),
+                       type = 3, detailed = FALSE, return_aov = TRUE)
+if (DIAGNOSTICS){
+  ezanova_residuals <- purrr::map(exgmu_stats$aov, residuals)
+  ezanova_residuals_tbl <- enframe(ezanova_residuals) %>% unnest
+  hist(ezanova_residuals_tbl$value)
+  shapiro.test(ezanova_residuals_tbl$value)
+  print(exgmu_stats, digits = 3)
+}
+
+# mu by lmer
+mu_lmer <- lmer(mu ~ Group*Distractors*Task + (1|Distractors:ID) + (1|Task:ID) + (1|ID), data = exgauss.mx)
+```
+
+
+
+### Constrasts for exgauss mu
+
+__Joint tests (F-contrasts) with facet line plot of interactions__
+
+```{r exgmu_CONTRAST, warning = FALSE, fig.align = "center"}
+
+levels(exgauss$all_factors)
+
+cbind(grid.lvls, mu = predict(mu_lmer, newdata = grid.lvls, re.form=NA)) %>%
+  ggplot(aes(Distractors, mu, linetype=Task)) + geom_point() +
+  geom_line(aes(group=Task),size=1) +
+  facet_wrap(~Group) + theme_bw() + ggtitle("RT mu / mean") + ylab("RT mu")
+
+# Hit rate by lmer - joint tests and facet line plot of interactions
+joint_tests(mu_lmer)
+print("Split by GROUP:")
+joint_tests(mu_lmer, by = "Group")
+print("Contrast GROUP over all conditions:")
+joint_tests(mu_lmer, by = c("Distractors", "Task"))
+print("Split by DISTRACTOR:")
+joint_tests(mu_lmer, by = "Distractors")
+print("Contrast DISTRACTOR over all conditions:")
+joint_tests(mu_lmer, by = c("Task", "Group"))
+print("Split by TASK:")
+joint_tests(mu_lmer, by = "Task")
+print("Contrast TASK over all conditions:")
+joint_tests(mu_lmer, by = c("Distractors", "Group"))
+
+```
+
+__Interaction of distractor state by Task:Full vs Right+Left is highly significant for CTRL, in contrast to ADHD.__
+
+```{r}
+# Contrasts - Interaction of distractor and task levels in CTRL
+cat("Contrast of DISTRACTOR x TASK(Full vs Right+Left) for CONTROL, ADHD, and between\n", con_drAF_ctrl, "\n", con_drAF_adhd, "\n", con_drAF_CvA)
+
+xgmu_contr <- lmer(mu ~ all_factors + (1|ID), data = exgauss)
+summary(glht(xgmu_contr, linfct = mcp(all_factors = con_drAF_ctrl)), test = Ftest())
+summary(glht(xgmu_contr, linfct = mcp(all_factors = con_drAF_adhd)), test = Ftest())
+summary(glht(xgmu_contr, linfct = mcp(all_factors = con_drAF_CvA)), test = Ftest())
+
+```
+
+### MU summary
+
+CTRL consistently slower than ADHD (not due to response hand effect), with largest difference in 'Task = attend-Right' and in 'Distractor = Present, Task = attend-Full'. Of note, Distractors affect CTRL weakly in Task = attend-Left/Right (F = 3.8, 3.3), but strongly in Task = attend-Full (F = 41.5), causing a strong interaction effect (F = 12.3) not present in ADHD (F = 2.2). 
+
+
+
+## SIGMA
+
+__Ex-Gaussian stats of Reaction time - sigma (gaussian dispersion)__
+
+```{r exgauss-sigma, warning = FALSE, fig.align = "center"}
+qqnorm(exgauss$sigma, main = "sigma Normal Q-Q Plot")
+qqline(exgauss$sigma)
+exgauss %>%
+  ggplot(aes(sigma, fill=Task)) +
+  geom_density(alpha=.4) +
+  facet_wrap(Group~Distractors, ncol=2) +
+  get(plot_theme)()
+
+# exgauss-sigma, group level.
+exgauss %>%
+  ggplot(aes(x = Distractors, y = sigma, linetype = Group, color = Group)) +
+  geom_boxplot(outlier.alpha = 0, alpha = 1/5) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2)) +
+  # geom_half_violin(draw_quantiles = c(0.25, 0.5, 0.75), alpha = 0) +
+  facet_wrap(~Task) +
+  xlab("Distractor state") +
+  ylab("RT ex-gauss sigma (ms)") +
+  ggtitle("RT ex-gauss sigma, all task conditions, group level") +
+  get(plot_theme)()
+if (SAVE)
+  ggsave(paste0(odir, "RTsigma.svg"))
+
+# RT ex-gauss sigma, group level, barchart with SEM.
+p_dodge <- position_dodge(width = 0.9)
+
+exgauss %>%
+  group_by(Group, Task, Distractors) %>%
+  summarise(exgsigma_mean = mean(sigma), exgsigma_sem = sd(sigma)/sqrt(n())) %>%
+  ggplot(aes(x = Distractors, y = exgsigma_mean, fill = Group)) +
+  geom_col(position = p_dodge) +
+  geom_errorbar(aes(ymin = exgsigma_mean - exgsigma_sem, ymax = exgsigma_mean + exgsigma_sem),
+                position = p_dodge, width = 0.25) +
+  facet_wrap(~Task) +
+  xlab("Distractor state") +
+  ylab("Mean of RT ex-gauss sigma (ms)") +
+  ggtitle("RT ex-gauss sigma, all task conditions, group level, +/- SEM") +
+  scale_fill_brewer(palette = "Greys") +
+  get(plot_theme)()
+
+# RT ex-gauss sigma, single subject.
+exgauss %>%
+  ggplot(aes(x = Distractors, y = sigma, color = dom_resp)) +
+  geom_line(aes(group = ID)) +
+  geom_point() +
+  facet_grid(Group ~ Task) +
+  xlab("Distractor state") +
+  ylab("RT ex-gauss sigma (ms)") +
+  ggtitle("RT ex-gauss sigma, all task conditions, single subject") +
+  get(plot_theme)() +
+  theme(legend.position = "none")
+
+# # Does response hand counter-balancing in CONTROL group affect exgauss SIGMA?
+with(exgauss,
+     ks.test(exgauss[Group == "Control" & dom_resp == FALSE,]$sigma,
+             exgauss[Group == "Control" & dom_resp == TRUE,]$sigma))
+```
+
+
+### Statistics for RTV - exgauss sigma:
+
+```{r rt_exgauss_sigma_stats, warning = FALSE, fig.align = "center"}
+# Mixed 3-way ANOVA.
+exgsigma_stats <- ezANOVA(exgauss, dv = .(sigma),
+                          wid = .(ID),
+                          within = .(Task, Distractors),
+                          between = .(Group),
+                          type = 3, detailed = FALSE, return_aov = TRUE)
+if (DIAGNOSTICS){
+  ezanova_residuals <- purrr::map(exgsigma_stats$aov, residuals)
+  ezanova_residuals_tbl <- enframe(ezanova_residuals) %>% unnest
+  hist(ezanova_residuals_tbl$value)
+  shapiro.test(ezanova_residuals_tbl$value)
+  print(exgsigma_stats)
+}
+
+# sigma by lmer
+sigma_lmer <- lmer(sigma ~ Group*Distractors*Task + (1|Distractors:ID) + (1|Task:ID) + (1|ID), data = exgauss.mx)
+```
+
+
+
+### Constrasts for exgauss sigma
+
+__SIGMA by LMM - joint tests and facet line plot of interactions__
+
+```{r exgsigma_CONTRAST, warning = FALSE, fig.align = "center"}
+# Repeat this for readability of contrasts
+levels(exgauss$all_factors)
+
+cbind(grid.lvls, sigma = predict(sigma_lmer, newdata = grid.lvls, re.form=NA)) %>%
+  ggplot(aes(Distractors, sigma, linetype=Task)) + geom_point() +
+  geom_line(aes(group=Task),size=1) +
+  facet_wrap(~Group) + theme_bw() + ggtitle("RT sigma / variability") + ylab("RT sigma")
+
+# Hit rate by lmer - joint tests and facet line plot of interactions
+joint_tests(sigma_lmer)
+joint_tests(sigma_lmer, by = "Group")
+joint_tests(sigma_lmer, by = c("Distractors", "Task"))
+joint_tests(sigma_lmer, by = "Distractors")
+joint_tests(sigma_lmer, by = c("Task", "Group"))
+joint_tests(sigma_lmer, by = "Task")
+joint_tests(sigma_lmer, by = c("Distractors", "Group"))
+
+```
+
+__Illustration of weak effect of Distractors per group, and interaction of Distractor and Task=Full vs Left/Right in CTRL__
+
+```{r}
+# Contrasts
+xgsigma_contr <- lmer(sigma ~ all_factors + (1|ID), data = exgauss)
+# summary(xgsigma_contr)
+
+# "main effect" of distractor within ADHD
+cat("CONTRAST main effect of distractor within ADHD", con_dstr_adhd)
+summary(glht(xgsigma_contr, linfct = mcp(all_factors = con_dstr_adhd)), test = Ftest())
+
+# "main effect" of distractor within CTRL
+cat("CONTRAST main effect of distractor within CTRL", con_dstr_ctrl)
+summary(glht(xgsigma_contr, linfct = mcp(all_factors = con_dstr_ctrl)), test = Ftest())
+
+# Interaction of distractor and task levels in CTRL
+cat("CONTRAST interaction of distractor and task levels in CTRL", con_drAF_ctrl)
+summary(glht(xgsigma_contr, linfct = mcp(all_factors = con_drAF_ctrl)), test = Ftest())
+
+```
+
+### SIGMA summary
+
+Sigma is consistently more variable for CTRL than for ADHD (F = 4.4). This is true in all conditions (F = 3.3 - 3.8) except Distractors = Absent Task = attend-Full, and Distractors = Present Task = attend-Right. The difference is strongest in Task = attend-Left (F = 4.4).
+
+Distractors have smaller effect here than for other DVs (F = 5.8), in fact the effect comes mainly from one condition, CTRL group Task = attend-Full (F = 7.9). Thus again the effect of Distractors on CTRL in attend-Full is unusually large (compared to ADHD or lateralised attending).
+
+## TAU
+
+Ex-Gaussian stats of Reaction time - tau (exponential tail)
+
+```{r exgauss-tau, warning = FALSE, fig.align = "center"}
+qqnorm(exgauss$tau, main = "tau Normal Q-Q Plot")
+qqline(exgauss$tau)
+exgauss %>%
+  ggplot(aes(tau, fill=Task)) +
+  geom_density(alpha=.4) +
+  facet_wrap(Group~Distractors, ncol=2) +
+  get(plot_theme)()
+
+# exgauss-tau, group level.
+exgauss %>%
+  ggplot(aes(x = Distractors, y = tau, linetype = Group, color = Group)) +
+  geom_boxplot(outlier.alpha = 0, alpha = 1/5) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2)) +
+  # geom_half_violin(draw_quantiles = c(0.25, 0.5, 0.75), alpha = 0) +
+  facet_wrap(~Task) +
+  xlab("Distractor state") +
+  ylab("RT ex-gauss tau (ms)") +
+  ggtitle("RT ex-gauss tau, all task conditions, group level") +
+  get(plot_theme)()
+if (SAVE)
+  ggsave(paste0(odir, "RTtau.svg"))
+
+# RT ex-gauss tau, group level, barchart with SEM.
+p_dodge <- position_dodge(width = 0.9)
+
+exgauss %>%
+  group_by(Group, Task, Distractors) %>%
+  summarise(exgtau_mean = mean(tau), exgtau_sem = sd(tau)/sqrt(n())) %>%
+  ggplot(aes(x = Distractors, y = exgtau_mean, fill = Group)) +
+  geom_col(position = p_dodge) +
+  geom_errorbar(aes(ymin = exgtau_mean - exgtau_sem, ymax = exgtau_mean + exgtau_sem),
+                position = p_dodge, width = 0.25) +
+  facet_wrap(~Task) +
+  xlab("Distractor state") +
+  ylab("Mean of RT ex-gauss tau (ms)") +
+  ggtitle("RT ex-gauss tau, all task conditions, group level, +/- SEM") +
+  scale_fill_brewer(palette = "Greys") +
+  get(plot_theme)()
+
+# RT ex-gauss tau, single subject.
+exgauss %>%
+  ggplot(aes(x = Distractors, y = tau, color = dom_resp)) +
+  geom_line(aes(group = ID)) +
+  geom_point() +
+  facet_grid(Group ~ Task) +
+  xlab("Distractor state") +
+  ylab("RT ex-gauss tau (ms)") +
+  ggtitle("RT ex-gauss tau, all task conditions, single subject") +
+  get(plot_theme)() +
+  theme(legend.position = "none")
+
+# # Does response hand counter-balancing in CONTROL group affect exgauss TAU?
+with(exgauss,
+     ks.test(exgauss[Group == "Control" & dom_resp == FALSE,]$tau,
+             exgauss[Group == "Control" & dom_resp == TRUE,]$tau))
+```
+
+
+### Statistics for RT ex-gauss tau:
+
+```{r rt_exgauss_tau_stats, warning = FALSE, fig.align = "center"}
+# Mixed 3-way ANOVA.
+exgtau_stats <- ezANOVA(exgauss, dv = .(tau),
+                        wid = .(ID),
+                        within = .(Task, Distractors),
+                        between = .(Group),
+                        type = 3, detailed = FALSE, return_aov = TRUE)
+if (DIAGNOSTICS){
+  ezanova_residuals <- purrr::map(exgtau_stats$aov, residuals)
+  ezanova_residuals_tbl <- enframe(ezanova_residuals) %>% unnest
+  hist(ezanova_residuals_tbl$value)
+  shapiro.test(ezanova_residuals_tbl$value)
+  print(exgtau_stats)
+}
+
+# tau by lmer
+tau_lmer <- lmer(tau ~ Group*Distractors*Task + (1|Distractors:ID) + (1|Task:ID) + (1|ID), data = exgauss.mx)
+```
+
+
+
+### Constrasts for exgauss tau
+
+__TAU by LMM - joint tests and facet line plot of interactions__
+
+```{r exgtau_CONTRAST, warning = FALSE, fig.align = "center"}
+# Repeat this for readability of contrasts
+levels(exgauss$all_factors)
+
+cbind(grid.lvls, tau = predict(tau_lmer, newdata = grid.lvls, re.form=NA)) %>%
+  ggplot(aes(Distractors, tau, linetype=Task)) + geom_point() +
+  geom_line(aes(group=Task),size=1) +
+  facet_wrap(~Group) + theme_bw() + ggtitle("RT tau / slowing") + ylab("RT tau")
+
+# Hit rate by lmer - joint tests and facet line plot of interactions
+joint_tests(tau_lmer)
+joint_tests(tau_lmer, by = "Group")
+joint_tests(tau_lmer, by = c("Distractors", "Task"))
+joint_tests(tau_lmer, by = "Distractors")
+joint_tests(tau_lmer, by = c("Task", "Group"))
+joint_tests(tau_lmer, by = "Task")
+joint_tests(tau_lmer, by = c("Distractors", "Group"))
+
+```
+
+__ADHD has interaction of Distractor and Task: more slowing for attend-Right in Absent than in Present, in contrast to other Task conditions__
+```{r}
+# Contrasts
+xgtau_contr <- lmer(tau ~ all_factors + (1|ID), data = exgauss)
+con_FvLR_Abs_adhd <- rbind("FvLR_Abs_adhd" = c(0,0.5,0,0,0,-0.25,0,0,0,-0.25,0,0))
+cat("CONTRAST Task=attend-Full vs Left/Right when Distractor=Absent in ADHD", con_FvLR_Abs_adhd)
+summary(glht(xgtau_contr, linfct = mcp(all_factors = con_FvLR_Abs_adhd)), test = Ftest())
+cat("CONTRAST Task=attendFull vs Left/Right in ADHD", con_drAR_adhd)
+summary(glht(xgtau_contr, linfct = mcp(all_factors = con_drAR_adhd)), test = Ftest())
+```
+
+
+### TAU summary
+
+There were no main effects or noticeable trends for TAU. The only noteworthy effect is Task=attend-Full vs Left/Right when Distractor=Absent in ADHD (F = 4.4). The visible difference in ADHD between Distractors' effect in Task=attend-Right (reduced slowing) and the other Task conditions (increased slowing) does not match a notable effect (F = 2.1)
+
+  
+## HIT RATES
+  
+```{r hit_rates, warning = FALSE, fig.align = "center"}
+# Normality test and visualise distros
+qqnorm(hit_rates$hit_rate, main = "Hit rates deviations Normal Q-Q Plot")
+qqline(hit_rates$hit_rate)
+# qqnorm(hit_rates$sq_hr, main = "sq-transformed Hit rates deviations Normal Q-Q Plot")
+# qqline(hit_rates$sq_hr)
+hit_rates %>%
+  ggplot(aes(hit_rate, fill=Task)) +
+  geom_density(alpha=.4) +
+  facet_wrap(Group~Distractors, ncol=2) +
+  get(plot_theme)()
+
+# Hit rates, group level.
+hit_rates %>%
+  ggplot(aes(x = Distractors, y = hit_rate, linetype = Group, color = Group)) +
+  geom_boxplot(outlier.alpha = 0, alpha = 1/5) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2)) +
+  # geom_half_violin(draw_quantiles = c(0.25, 0.5, 0.75), alpha = 0) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~Task) +
+  xlab("Distractor state") +
+  ylab("Hit rate") +
+  ggtitle("Hit rates, all task conditions, group level") +
+  get(plot_theme)()
+if (SAVE)
+  ggsave(paste0(odir, "HITS.svg"))
+
+# Hit rates, group level, barchart with SEM.
+p_dodge <- position_dodge(width = 0.9)
+
+hit_rates %>%
+  group_by(Group, Task, Distractors) %>%
+  summarise(HR_mean = mean(hit_rate), HR_sem = sd(hit_rate)/sqrt(n())) %>%
+  ggplot(aes(x = Distractors, y = HR_mean, fill = Group)) +
+  geom_col(position = p_dodge) +
+  geom_errorbar(aes(ymin = HR_mean - HR_sem, ymax = HR_mean + HR_sem),
+                position = p_dodge, width = 0.25) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~Task) +
+  xlab("Distractor state") +
+  ylab("Hit rate") +
+  ggtitle("Hit rates, all task conditions, group level, +/- SEM") +
+  scale_fill_brewer(palette = "Greys") +
+  get(plot_theme)()
+
+# Hit rates, single subject.
+hit_rates %>%
+  ggplot(aes(x = Distractors, y = hit_rate, color = dom_resp)) +
+  geom_line(aes(group = ID)) +
+  geom_point() +
+  scale_y_continuous(labels = scales::percent) +
+  facet_grid(Group ~ Task) +
+  xlab("Distractor state") +
+  ylab("Hit rate") +
+  ggtitle("Hit rates, all task conditions, single subject (color = response hand dominant)") +
+  get(plot_theme)() +
+  theme(legend.position = "none")
+
+# Does response hand counter-balancing in CONTROL group affect hit rates?
+with(hit_rates,
+     ks.test(hit_rates[Group == "Control" & dom_resp == FALSE,]$hit_rate,
+             hit_rates[Group == "Control" & dom_resp == TRUE,]$hit_rate))
+```
+
+### Statistics for hit rates
+
+```{r hit_rates_stats, warning = FALSE, fig.align = "center"}
+# Mixed 3-way ANOVA.
+hr_stats <- ezANOVA(hit_rates, dv = .(hit_rate),
+                    wid = .(ID),
+                    within = .(Task, Distractors),
+                    between = .(Group),
+                    type = 3, detailed = FALSE, return_aov = TRUE)
+if (DIAGNOSTICS){
+  ezanova_residuals <- purrr::map(hr_stats$aov, residuals)
+  ezanova_residuals_tbl <- enframe(ezanova_residuals) %>% unnest
+  hist(ezanova_residuals_tbl$value)
+  shapiro.test(ezanova_residuals_tbl$value)
+  print(hr_stats)
+}
+
+# Hit rate by lmer
+hr_lmer <- lmer(hit_rate ~ Group*Distractors*Task + (1|Distractors:ID) + (1|Task:ID) + (1|ID), data = hit_rates)
+```
+
+### Constrasts for Hit Rates
+
+__Hit rate by LMM - joint tests and facet line plot of interactions__
+
+```{r hit_rates_CONTRAST, warning = FALSE, fig.align = "center"}
+levels(hit_rates$all_factors)
+
+cbind(grid.lvls, hr = predict(hr_lmer, newdata = grid.lvls, re.form=NA)) %>%
+  ggplot(aes(Distractors, hr, linetype=Task)) + geom_point() +
+  geom_line(aes(group=Task),size=1) +
+  facet_wrap(~Group) + theme_bw() + ggtitle("HR values") + ylab("Hit Rate")
+
+joint_tests(hr_lmer)
+joint_tests(hr_lmer, by = "Group")
+joint_tests(hr_lmer, by = c("Distractors", "Task"))
+joint_tests(hr_lmer, by = "Distractors")
+joint_tests(hr_lmer, by = c("Task", "Group"))
+joint_tests(hr_lmer, by = "Task")
+joint_tests(hr_lmer, by = c("Distractors", "Group"))
+
+```
+
+
+__Distractor effect interacts with Task=Full vs Left/Right in CTRL, and the difference of this effect with ADHD is also noticeable__
+```{r}
+# Contrasts
+hit_rates$Group <- relevel(hit_rates$Group, ref = "Control")
+hit_rates$all_factors <- with(hit_rates, interaction(Group, Distractors, Task))
+hr_contr <- lmer(hit_rate ~ all_factors + (1|ID), data = hit_rates)
+
+# Interaction of distractor and task levels in CTRL
+cat("TEST CONTRAST: drAF_ctrl", con_drAF_ctrl)
+summary(glht(hr_contr, linfct = mcp(all_factors = con_drAF_ctrl)), test = Ftest())
+# Interaction of distractor and task levels in ADHD
+cat("TEST CONTRAST: drAF_adhd", con_drAF_adhd)
+summary(glht(hr_contr, linfct = mcp(all_factors = con_drAF_adhd)), test = Ftest())
+
+# Interaction of distractor and task levels between ADHD & CTRL
+cat("TEST CONTRAST: drAF_ctrl V ADHD", con_drAF_CvA)
+summary(glht(hr_contr, linfct = mcp(all_factors = con_drAF_CvA)), test = Ftest())
+
+```
+
+
+### Hit Rate summary
+CTRL performance was affected by response handedness, rendering this DV problematic for group comparison (even this result is counter-intuitive as the dominant-hand CTRL subgroup performed worse than the non-dominant hand subgroup). However, the most noteworthy result here is intra-group: CTRL show again a large interaction between Distractor effect and Task, with more impact of Distractors on Task=attend-Full than Left/Right (F = 9.7). The interaction is not present in ADHD (F = 0.3), such that the difference between groups in terms of this interaction is noteworthy (F = 3.5).
+
+
+
+## FALSE ALARMS
+
+```{r fa_rates, warning = FALSE, fig.align = "center"}
+# Normality test and visualise distros
+qqnorm(fa_rates$fa_rate, main = "False Alarm rates deviations Normal Q-Q Plot")
+qqline(fa_rates$fa_rate)
+# qqnorm(fa_rates$sq_far, main = "sq-transformed False Alarm rates deviations Normal Q-Q Plot")
+# qqline(fa_rates$sq_far)
+fa_rates %>%
+  ggplot(aes(fa_rate, fill=Task)) +
+  geom_density(alpha=.4) +
+  facet_wrap(Group~Distractors, ncol=2) +
+  get(plot_theme)()
+
+# False alarm rates, group level.
+fa_rates %>%
+  ggplot(aes(x = Distractors, y = fa_rate, linetype = Group, color = Group)) +
+  geom_boxplot(outlier.alpha = 0, alpha = 1/5) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2)) +
+  # geom_half_violin(draw_quantiles = c(0.25, 0.5, 0.75), alpha = 0) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~Task) +
+  xlab("Distractor state") +
+  ylab("False alarm rate") +
+  ggtitle("False alarm rates, all task conditions, group level") +
+  get(plot_theme)()
+if (SAVE)
+  ggsave(paste0(odir, "FArate.svg"))
+
+# False alarm rates, group level, barchart with SEM.
+p_dodge <- position_dodge(width = 0.9)
+
+fa_rates %>%
+  group_by(Group, Task, Distractors) %>%
+  summarise(FA_mean = mean(fa_rate), FA_sem = sd(fa_rate)/sqrt(n())) %>%
+  ggplot(aes(x = Distractors, y = FA_mean, fill = Group)) +
+  geom_col(position = p_dodge) +
+  geom_errorbar(aes(ymin = FA_mean - FA_sem, ymax = FA_mean + FA_sem),
+                position = p_dodge, width = 0.25) +
+  scale_y_continuous(labels = scales::percent) +
+  facet_wrap(~Task) +
+  xlab("Distractor state") +
+  ylab("False alarm rate") +
+  ggtitle("False alarm rates, all task conditions, group level, +/- SEM") +
+  scale_fill_brewer(palette = "Greys") +
+  get(plot_theme)()
+
+# False alarm rates, single subject.
+fa_rates %>%
+  ggplot(aes(x = Distractors, y = fa_rate, color = dom_resp)) +
+  geom_line(aes(group = ID)) +
+  geom_point() +
+  scale_y_continuous(labels = scales::percent) +
+  facet_grid(Group ~ Task) +
+  xlab("Distractor state") +
+  ylab("False alarm rate") +
+  ggtitle("False alarm rates, all task conditions, single subject") +
+  get(plot_theme)() +
+  theme(legend.position = "none")
+
+# Does response hand counter-balancing in CONTROL group affect FA rates?
+with(fa_rates,
+     ks.test(fa_rates[Group == "Control" & dom_resp == FALSE,]$fa_rate,
+             fa_rates[Group == "Control" & dom_resp == TRUE,]$fa_rate))
+```
+
+### Statistics for false alarm rates:
+
+```{r fa_rates_stats, warning = FALSE, fig.align = "center"}
+# Mixed 3-way ANOVA.
+fa_stats <- ezANOVA(fa_rates, dv = .(fa_rate),
+                    wid = .(ID),
+                    within = .(Task, Distractors),
+                    between = .(Group),
+                    type = 3, detailed = FALSE, return_aov = TRUE)
+if (DIAGNOSTICS){
+  ezanova_residuals <- purrr::map(fa_stats$aov, residuals)
+  ezanova_residuals_tbl <- enframe(ezanova_residuals) %>% unnest
+  hist(ezanova_residuals_tbl$value)
+  shapiro.test(ezanova_residuals_tbl$value)
+  print(fa_stats)
+}
+
+# False Alarm by lmer
+fa_lmer <- lmer(fa_rate ~ Group*Distractors*Task + (1|Distractors:ID) + (1|Task:ID) + (1|ID), data = fa_rates)
+```
+
+
+### Constrasts for False Alarms
+
+__False Alarm by LMM - joint tests and facet line plot of interactions__
+
+```{r false_alarm_CONTRAST, warning = FALSE, fig.align = "center"}
+
+fa.grid.lvls <- expand.grid(Task = c('AttendLeft', 'AttendNone', 'AttendRight'),
+                            Distractors = c('Absent', 'Present'),
+                            Group = c('ADHD', 'Control'))
+
+cbind(fa.grid.lvls, fa = predict(fa_lmer, newdata = fa.grid.lvls, re.form=NA)) %>%
+  ggplot(aes(Distractors, fa, linetype=Task)) + geom_point() +
+  geom_line(aes(group=Task),size=1) +
+  facet_wrap(~Group) + theme_bw() + ggtitle("False Alarms") + ylab("False Alarms")
+
+joint_tests(fa_lmer)
+joint_tests(fa_lmer, by = "Group")
+joint_tests(fa_lmer, by = "Task")
+```
+
+
+### False Alarm summary
+
+There were no noteworthy effects of False Alarms: groups were not different in any condition; Distractor effects behaved as expected (large effect in Task = attend-Left/Right (F = 17/20), no effect in attend-None (F = 0.1)); there was an interaction between Distractor and Task.
+
+
+## DISTRACTOR EFFECT
+
+```{r distractor_effect, warning = FALSE, fig.align = "center"}
+# Distractor effect, group level.
+distractor_effect %>%
+  ggplot(aes(x = Task, y = distractor_effect, linetype = Group, color = Group)) +
+  geom_boxplot(outlier.alpha = 0, alpha = 1/5) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.2)) +
+  xlab("Task") +
+  ylab("Distractor effect") +
+  ggtitle("Distractor effect, all task conditions, group level") +
+  get(plot_theme)()
+
+# Distractor effect, group level, barchart with SEM.
+p_dodge <- position_dodge(width = 0.9)
+
+distractor_effect %>%
+  group_by(Group, Task) %>%
+  summarise(DE_mean = mean(distractor_effect),
+            DE_sem = sd(distractor_effect)/sqrt(n())) %>%
+  ggplot(aes(x = Task, y = DE_mean, fill = Group)) +
+  geom_col(position = p_dodge) +
+  geom_errorbar(aes(ymin = DE_mean - DE_sem, ymax = DE_mean + DE_sem),
+                position = p_dodge, width = 0.25) +
+  xlab("Task") +
+  ylab("Distractor effect") +
+  ggtitle("Distractor effect, all task conditions, group level, +/- SEM") +
+  scale_fill_brewer(palette = "Greys") +
+  get(plot_theme)()
+
+# Normality test and visualise distros
+qqnorm(distractor_effect$distractor_effect, main = "distractor_effect deviations Normal Q-Q Plot")
+qqline(distractor_effect$distractor_effect)
+# qqnorm(distractor_effect$log_de, main = "Log-transformed distractor_effect deviations Normal Q-Q Plot")
+# qqline(distractor_effect$log_de)
+distractor_effect %>%
+  ggplot(aes(distractor_effect, fill=Task)) +
+  geom_density(alpha=.4) +
+  facet_wrap(~Group, ncol=2) +
+  get(plot_theme)()
+
+# Distractor effect, single subject.
+distractor_effect %>%
+  ggplot(aes(x = Task, y = distractor_effect, color = dom_resp)) +
+  geom_line(aes(group = ID)) +
+  geom_point() +
+  facet_wrap(~Group) +
+  xlab("Task") +
+  ylab("Distractor effect") +
+  ggtitle("Distractor effect, all task conditions, single subject") +
+  get(plot_theme)() +
+  theme(legend.position = "none")
+```
+
+
+### Statistics for distractor effect:
+
+```{r distractor_effect_stats, warning = FALSE, fig.align = "center"}
+# Mixed 2-way ANOVA.
+de_stats <- ezANOVA(distractor_effect, dv = .(distractor_effect),
+                    wid = .(ID),
+                    within = .(Task),
+                    between = .(Group),
+                    type = 3, detailed = FALSE, return_aov = TRUE)
+if (DIAGNOSTICS){
+  ezanova_residuals <- purrr::map(de_stats$aov, residuals)
+  ezanova_residuals_tbl <- enframe(ezanova_residuals) %>% unnest
+  hist(ezanova_residuals_tbl$value)
+  shapiro.test(ezanova_residuals_tbl$value)
+  print(de_stats)
+}
+
+# distractor effect by lmer
+de_lmer <- lmer(distractor_effect ~ Group*Task + (1|ID), data = distractor_effect)
+
+distractor_effect$Group <- relevel(distractor_effect$Group, ref = "Control")
+distractor_effect$all_factors <- with(distractor_effect, interaction(Group, Task))
+levels(distractor_effect$all_factors)
+de_contr <- lmer(distractor_effect ~ all_factors + (1|ID), data = distractor_effect)
+
+```
+
+
+### Contrasts for distractor effect:
+
+
+```{r}
+de.grid.lvls <- expand.grid(Task = c('AttendFull', 'AttendLeft', 'AttendRight'),
+                            Group = c('ADHD', 'Control'))
+
+cbind(de.grid.lvls, de = predict(de_lmer, newdata = de.grid.lvls, re.form=NA)) %>%
+  ggplot(aes(Task, de, linetype=Group)) + geom_point() +
+  geom_line(aes(group=Group),size=1) +
+  theme_bw() + ggtitle("Distractor Effect") + ylab("Distractor Effect")
+
+joint_tests(de_lmer)
+joint_tests(de_lmer, by = "Group")
+joint_tests(de_lmer, by = "Task")
+
+# "main effect" of task within ADHD & CTRL
+con_FvLR_adhd <- rbind("FvLR_adhd" = c(0,1,0,-0.5,0,-0.5))
+summary(glht(de_contr, linfct = mcp(all_factors = con_FvLR_adhd)), test = Ftest())
+con_FvLR_ctrl <- rbind("FvLR_ctrl" = c(1,0,-0.5,0,-0.5,0))
+summary(glht(de_contr, linfct = mcp(all_factors = con_FvLR_ctrl)), test = Ftest())
+
+con_RvFL_ctrl <- rbind("RvFL_ctrl" = c(-0.5,0,-0.5,0,1,0))
+summary(glht(de_contr, linfct = mcp(all_factors = con_RvFL_ctrl)), test = Ftest())
+
+# Interaction of task levels and ADHD vs CTRL
+con_F_CvA <- rbind("FvLR_CvA" = contrasts21(con_FvLR_adhd * -1 + con_FvLR_ctrl))
+cat("TEST CONTRAST: FvLR ctrl V ADHD", con_F_CvA)
+summary(glht(de_contr, linfct = mcp(all_factors = con_F_CvA)), test = Ftest())
+```
+
+### DE summary
+
+There was no difference between groups in Distractor effect. Task = attend-Full differed strongly from Left/Right for CTRL group (F = 11), and this induced a between groups difference with ADHD in the same Task contrast (F = 4.2)
