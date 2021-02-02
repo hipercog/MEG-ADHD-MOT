@@ -5,6 +5,21 @@ contrasts21 <- function(x) {
   return(y)
 }
 
+get_trim_points <-function(x, lo = 0.005, hi = 0.995) {
+  x.ecdf <- ecdf(x)
+  vals <- get("x", environment(x.ecdf))
+  probs <- get("y", environment(x.ecdf))
+  lo_thresh <- vals[1]
+  if (min(probs) <= lo) {
+    lo_thresh <- max(vals[probs < lo])
+  }
+  hi_thresh <- vals[length(vals)]
+  if (max(probs) >= hi) {
+    hi_thresh <- min(vals[probs > hi])
+  }
+  
+  return(list("lo" = lo_thresh, "hi" = hi_thresh))
+} 
 
 wtf_is <- function(x) {
   # For when you have no idea what something is.

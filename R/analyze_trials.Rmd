@@ -38,7 +38,7 @@ source('znbnz_utils.R')
 demographics_path <- paste0(here(), "/data/subjects_log.xlsx")
 
 # Path to the folder containing trials data in csv-format.
-trials_path <- paste0(here(), "/data/trials")
+trials_path <- paste0(here(), "/data/trials_trim")
 
 # Path to figure output folder
 SAVE <- FALSE
@@ -88,20 +88,18 @@ trials_data$Blink = as.factor(trials_data$Blink)
 
 ## Pruning
 
-__Discarding subjects before preprocessing__. First, we use the following criteria for choosing the subjects to be 
-preprocessed in the first place:
+__Discarding subjects before preprocessing__. First, we use the following criteria for choosing the subjects to bepreprocessed in the first place:
 
 * subjects have been measured with the photodetector
 * subjects have the full number of usable sets (= 4)
 * subjects do not have too many trial-rejections
 
 ```{r discard_by_photod-sets, warning = FALSE}
-  # filter(Photodetector == TRUE, n_sets == 4) %>% 
-demographics %>% 
+analysis_trials <- demographics %>% 
   filter(Valid_for_analysis == TRUE) %>%
   mutate("dom_resp" = Handedness == Response_hand) %>%
   select(ID, dom_resp) %>% 
-  inner_join(trials_data, by = "ID") -> analysis_trials
+  inner_join(trials_data, by = "ID")
  analysis_trials$ID = as.factor(analysis_trials$ID)
 
 levels(analysis_trials$Resp)[1] <- "Hit"
@@ -123,7 +121,7 @@ analysis_trials %>%
     # scale_y_continuous(limits = c(0, 0.700), breaks = seq(0, 0.700, 0.100)) +
     xlab("Subject") +  
     ylab("Reaction time (s)") +
-    ggtitle("Reaction time distribution, all subjects, all trials") +
+    ggtitle("Reaction time distribution, all subjects, trimmed trials") +
     get(plot_theme)() +
     theme(axis.text.x = element_text(angle = 45, hjust = 1))
 
@@ -141,51 +139,7 @@ analysis_trials %>%
     get(plot_theme)() +
     theme(legend.position = "none") 
 }
-```
 
-
-If we believe that the RT distribution tails reflect theoretically invalid processes, we could consider trimming them, i.e. discard trials whose RT's are above or below some theoretical limit.
-
-* less than 180 ms (which is mean minus 2SD, based on Table 2 from Woods, et al., 2015 Front Hum Neurosci. 2015; 9:131)
-* above median + 5 times the median absolute deviation (but we have no theoretical justification for this)
-
-_However_, we actually have no strong motivation for this approach, since
-
-(a) it is not clear where the threshold should be
-(b) we aim to use parametric test statistics (based on fitting ex-gaussian distribution), for which it is better to have the original data for fitting and rely on the robustness of the statistics to account for outliers.
-
-Still, we visualise how many trials would be rejected based on such thresholds
-
-```{r preproc_rt, warning = FALSE, fig.align = "center"}
-rt_thr <- 0.18
-
-if (PLOTS){
-# Number of outlier RT's per subject.
-analysis_trials %>%
-  group_by(ID) %>%
-  filter(TrialType == "Real") %>% 
-  filter((RT > 0 & RT <= rt_thr) | RT > (median(RT) + 5*mad(RT))) %>%
-  summarise(nb_outliers = n()) %>% 
-  ggplot(aes(x = ID, y = nb_outliers)) +
-    geom_col() +
-    xlab("Subject") + 
-    ylab("Number of trials") +
-    ggtitle("Number of trials to be discarded by RT") +
-    get(plot_theme)() +
-    theme(axis.text.x = element_text(angle = 45, hjust = 1))
-}
-# Group level number of target events
-# analysis_trials %>% 
-#   filter(TrialType == "Real") %>% 
-#   group_by(ID, Group, Task, Distractors) %>% 
-#   summarise(n_trials = n()) %>% 
-#   ungroup() %>% 
-#   group_by(Group, Task, Distractors) %>% 
-#   summarise(mean_trials = mean(n_trials), sd_trials = sd(n_trials))
-
-
-# We'll keep RT == 0 trials since they are catch trials or misses.
-# analysis_trials %>% filter((RT == 0) | (RT > rt_thr & RT < (median(RT) + 5*mad(RT)))) -> trials_ok
 analysis_trials -> trials_ok
 ```
 
